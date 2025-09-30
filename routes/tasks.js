@@ -4,7 +4,7 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const User = require('../models/User');
 const Task = require('../models/Task');
-const firebaseAdmin = require('../service/firebaseAdmin'); // your admin instance
+const { admin: firebaseAdmin, getMessaging } = require('../service/firebaseAdmin');
 
 console.log('Loading tasks routes...');
 
@@ -75,8 +75,16 @@ router.get('/users', auth, async (req, res) => {
  * - tokenToUserIds maps token -> [userId,...] so cleanup can remove token for all users if invalid
  */
 async function sendTaskAssignedNotifications(task, assignedUserIds = []) {
-  if (!firebaseAdmin || !firebaseAdmin.messaging) {
-    console.warn('firebaseAdmin not configured — skipping push send');
+  // get messaging instance from service
+  let messaging;
+  try {
+    messaging = (typeof getMessaging === 'function') ? getMessaging() : (firebaseAdmin && firebaseAdmin.messaging ? firebaseAdmin.messaging() : null);
+  } catch (e) {
+    messaging = null;
+  }
+
+  if (!messaging || typeof messaging.sendMulticast !== 'function') {
+    console.warn('Firebase messaging not available — skipping push send');
     return;
   }
   try {
@@ -124,7 +132,8 @@ async function sendTaskAssignedNotifications(task, assignedUserIds = []) {
       tokens: uniqueTokens
     };
 
-   const resp = await firebaseAdmin.messaging().sendMulticast(message);
+const resp = await messaging.sendMulticast(message);
+
     console.log('FCM sendMulticast results', { success: resp.successCount, failure: resp.failureCount });
 
     if (resp.failureCount > 0) {
