@@ -4,7 +4,10 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const User = require('../models/User');
 const Task = require('../models/Task');
-const { admin: firebaseAdmin, getMessaging } = require('../service/firebaseAdmin');
+// add this to top of routes/tasks.js (below other requires)
+const notificationService = require('../service/notificationService');
+// notificationService should export: getAccessToken and sendNotificationToUser (as in your snippet)
+
 
 console.log('Loading tasks routes...');
 
@@ -74,96 +77,80 @@ router.get('/users', auth, async (req, res) => {
  * Helper: send notifications to assigned users (sends to all tokens found)
  * - tokenToUserIds maps token -> [userId,...] so cleanup can remove token for all users if invalid
  */
+// Replace the old sendTaskAssignedNotifications function with this one:
+
 async function sendTaskAssignedNotifications(task, assignedUserIds = []) {
-  // get messaging instance from service
-  let messaging;
-  try {
-    messaging = (typeof getMessaging === 'function') ? getMessaging() : (firebaseAdmin && firebaseAdmin.messaging ? firebaseAdmin.messaging() : null);
-  } catch (e) {
-    messaging = null;
+  console.log(`Notification flow start for task ${task._id} (title: "${task.title}")`);
+  if (!Array.isArray(assignedUserIds) || assignedUserIds.length === 0) {
+    console.log('No assigned users, skipping notifications.');
+    return { sent: 0, failed: 0, details: [] };
   }
 
-  if (!messaging || typeof messaging.sendMulticast !== 'function') {
-    console.warn('Firebase messaging not available — skipping push send');
-    return;
-  }
   try {
-    // fetch users and their token fields
-    const users = await User.find({ _id: { $in: assignedUserIds } }).select('fcmTokens fcmToken name email');
+    // 1) Fetch users and tokens from DB
+    console.log('Fetching users from DB for assignedUserIds:', assignedUserIds);
+    const users = await User.find({ _id: { $in: assignedUserIds } }).select('fcmTokens fcmToken username name');
+    console.log(`Fetched ${users.length} users from DB.`);
 
-    // build tokens array and map token -> [userId,...]
-    const tokens = [];
-    const tokenToUserIds = {}; // { token: [userId1, userId2] }
-    users.forEach(u => {
+    // 2) For each user, call your notificationService.sendNotificationToUser to perform sending
+    const allResults = [];
+    for (const u of users) {
       const uid = u._id.toString();
-      // collect from fcmTokens array if exists
-      if (Array.isArray(u.fcmTokens)) {
-        u.fcmTokens.forEach(entry => {
-          const tk = (entry && entry.token) ? entry.token : null;
-          if (tk) {
-            if (!tokenToUserIds[tk]) tokenToUserIds[tk] = [];
-            if (!tokenToUserIds[tk].includes(uid)) tokenToUserIds[tk].push(uid);
-            tokens.push(tk);
+      console.log(`Preparing to send notification to user ${uid} (${u.username || u.name || '<no-username>'})`);
+      try {
+        // sendNotificationToUser (your helper) will fetch tokens from DB and call FCM (it logs too)
+        const results = await notificationService.sendNotificationToUser(uid, `New Task: ${task.title}`, task.description || '');
+        console.log(`sendNotificationToUser returned for user ${uid}:`, JSON.stringify(results, null, 2));
+
+        // results is an array of per-token send results { token, status, data|error }
+        allResults.push({ userId: uid, ok: true, results });
+      } catch (sendErr) {
+        console.error(`Error sending notifications to user ${uid}:`, sendErr && (sendErr.message || sendErr));
+        // If sendNotificationToUser throws, include that in results
+        allResults.push({ userId: uid, ok: false, error: (sendErr && sendErr.message) || sendErr });
+      }
+    }
+
+    // 3) Analyze results to detect failed tokens and clean them
+    const failedTokens = [];
+    allResults.forEach(uRes => {
+      if (uRes.ok && Array.isArray(uRes.results)) {
+        uRes.results.forEach(r => {
+          if (r.status !== 'sent') {
+            // either your sendNotificationToUser pushed { status: 'failed', error: '...' }
+            failedTokens.push({ token: r.token, userId: uRes.userId, reason: r.error || 'unknown' });
+          } else if (r.data && r.data.error) {
+            // in case your send returns an FCM error inside data
+            failedTokens.push({ token: r.token, userId: uRes.userId, reason: JSON.stringify(r.data) });
           }
         });
       }
-      // legacy single token support
-      if (u.fcmToken && typeof u.fcmToken === 'string') {
-        const tk = u.fcmToken;
-        if (!tokenToUserIds[tk]) tokenToUserIds[tk] = [];
-        if (!tokenToUserIds[tk].includes(uid)) tokenToUserIds[tk].push(uid);
-        tokens.push(tk);
-      }
     });
 
-    // dedupe tokens but keep index alignment for responses? we'll dedupe to avoid duplicate sends
-    const uniqueTokens = Array.from(new Set(tokens));
-    if (uniqueTokens.length === 0) return;
-
-    const message = {
-      notification: {
-        title: 'New Task Assigned',
-        body: task.title || 'You have a new task assigned'
-      },
-      data: {
-        taskId: task._id.toString(),
-        type: 'task_assigned'
-      },
-      tokens: uniqueTokens
-    };
-
-const resp = await messaging.sendMulticast(message);
-
-    console.log('FCM sendMulticast results', { success: resp.successCount, failure: resp.failureCount });
-
-    if (resp.failureCount > 0) {
-      // resp.responses aligns with uniqueTokens index
-      const failedTokens = [];
-      resp.responses.forEach((r, idx) => {
-        if (!r.success) {
-          const badToken = uniqueTokens[idx];
-          const errorCode = r.error && r.error.code;
-          failedTokens.push({ token: badToken, error: errorCode });
-        }
-      });
-
-      // Remove failed tokens from user documents
-      for (const { token, error } of failedTokens) {
+    if (failedTokens.length > 0) {
+      console.log('Cleaning up failed tokens:', JSON.stringify(failedTokens, null, 2));
+      for (const f of failedTokens) {
         try {
-          console.log('Removing invalid token:', token, 'error:', error);
-          // remove from fcmTokens array wherever it exists
-          await User.updateMany({ 'fcmTokens.token': token }, { $pull: { fcmTokens: { token } } });
-          // also clear legacy fcmToken string where it matches
-          await User.updateMany({ fcmToken: token }, { $unset: { fcmToken: '' } });
+          // remove token from any fcmTokens arrays and clear legacy fcmToken fields
+          await User.updateMany({ 'fcmTokens.token': f.token }, { $pull: { fcmTokens: { token: f.token } } });
+          await User.updateMany({ fcmToken: f.token }, { $unset: { fcmToken: '' } });
+          console.log(`Removed invalid token for user ${f.userId} token (first12): ${f.token.slice(0,12)}... reason: ${f.reason}`);
         } catch (cleanupErr) {
-          console.error('Error cleaning up invalid token:', token, cleanupErr);
+          console.error('Error removing invalid token', f.token, cleanupErr);
         }
       }
+    } else {
+      console.log('No failed tokens returned by FCM.');
     }
+
+    console.log(`Notification flow complete for task ${task._id}`);
+    return { sentSummary: allResults, failedTokens };
   } catch (err) {
-    console.error('Error sending task notifications:', err);
+    console.error('Unexpected error in sendTaskAssignedNotifications:', err);
+    throw err;
   }
 }
+
 
 // POST /api/tasks  <-- create task endpoint (sends notifications to assigned users)
 router.post('/', auth, async (req, res) => {
@@ -186,12 +173,16 @@ router.post('/', auth, async (req, res) => {
       createdBy: req.user && req.user.id
     });
 
-    await newTask.save();
+   await newTask.save();
     await newTask.populate('assignedTo', '-password -fcmTokens -fcmToken');
     await newTask.populate('createdBy', '-password -fcmTokens -fcmToken');
-
-    // fire-and-forget notification send (non-blocking for client) but we'll attempt to await/send and log
-    sendTaskAssignedNotifications(newTask, assignedArr).catch(err => console.error('Notification send error:', err));
+ console.log('Task saved to DB:', { id: newTask._id.toString(), title: newTask.title, assignedTo: assignedArr });
+    try {
+      const notifyResult = await sendTaskAssignedNotifications(newTask, assignedArr);
+      console.log('Notification send result for task', newTask._id.toString(), ':', JSON.stringify(notifyResult, null, 2));
+    } catch (notifyErr) {
+      console.error('Error while sending notifications for task', newTask._id.toString(), notifyErr);
+    }
 
     return res.status(201).json({ message: 'Task created', task: newTask });
   } catch (err) {
