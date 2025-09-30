@@ -90,24 +90,33 @@ async function sendTaskAssignedNotifications(task, assignedUserIds = []) {
 
   const sendSummary = [];
 
-  // 2) For each user, call notificationService.sendNotificationToUser(userId, title, body)
+  // 2) For each user, call notificationService with proper parameters
   for (const u of users) {
     const uid = u._id.toString();
     const who = u.username || u.name || uid;
     console.log(`Preparing to send notification to user ${uid} (${who})`);
 
     try {
-      // notificationService.sendNotificationToUser will:
-      // - fetch user's tokens from DB internally
-      // - call FCM endpoint for each token and log the response there
-      const results = await notificationService.sendNotificationToUser(uid, `New Task: ${task.title}`, task.description || '');
-      console.log(`sendNotificationToUser results for ${uid}:`, JSON.stringify(results, null, 2));
+      // FIXED: Pass UserModel as first parameter, userId as second, payload object as third
+      const results = await notificationService.sendNotificationToUserFromDb(
+        User,  // Pass the User model
+        uid,   // User ID
+        {      // Payload object
+          title: `New Task: ${task.title}`,
+          body: task.description || 'You have been assigned a new task',
+          data: {
+            taskId: task._id.toString(),
+            taskTitle: task.title
+          }
+        }
+      );
+      console.log(`sendNotificationToUserFromDb results for ${uid}:`, JSON.stringify(results, null, 2));
 
       // gather failures for cleanup
-      const failed = results.filter(r => r.status !== 'sent' || (r.data && r.data.error));
+      const failed = results.filter(r => !r.ok);
       sendSummary.push({ userId: uid, ok: failed.length === 0, results, failed });
     } catch (sendErr) {
-      console.error(`sendNotificationToUser threw for user ${uid}:`, sendErr && (sendErr.message || sendErr));
+      console.error(`sendNotificationToUserFromDb threw for user ${uid}:`, sendErr && (sendErr.message || sendErr));
       sendSummary.push({ userId: uid, ok: false, error: sendErr && (sendErr.message || sendErr) });
     }
   }
@@ -117,11 +126,12 @@ async function sendTaskAssignedNotifications(task, assignedUserIds = []) {
   sendSummary.forEach(entry => {
     if (entry.failed && entry.failed.length) {
       entry.failed.forEach(f => {
-        // f may be { token, status:'failed', error } or { token, status:'sent', data:{error:...} }
-        const tokenVal = f.token || (f.data && f.data.error && f.data.registration_token) || null;
-        const token = f.token || (f.data && f.data.token) || null;
-        // prefer f.token
-        if (f.token) failedTokensToCleanup.push({ token: f.token, reason: f.error || (f.data && JSON.stringify(f.data)) || 'unknown' });
+        if (f.token) {
+          failedTokensToCleanup.push({ 
+            token: f.token, 
+            reason: f.error || 'unknown' 
+          });
+        }
       });
     }
   });
