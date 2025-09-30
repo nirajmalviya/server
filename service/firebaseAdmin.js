@@ -1,44 +1,90 @@
 // service/firebaseAdmin.js
+'use strict';
+
 const admin = require('firebase-admin');
 const path = require('path');
+const fs = require('fs');
 
 function loadServiceAccount() {
-  // Option A: JSON string in env (recommended for Render)
+  // 1) Preferred: full JSON in env var (works well on Render)
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     try {
-      return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+      // Allow both stringified JSON and already-parsed object
+      if (typeof raw === 'string') {
+        return JSON.parse(raw);
+      }
+      return raw;
     } catch (err) {
-      console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON:', err);
+      console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON:', err.message || err);
       throw err;
     }
   }
 
-  // Option B: file path (legacy)
-  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './serviceAccountKey.json';
+  // 2) Optional alternate env var name (some scripts use SERVICE_ACCOUNT_KEY)
+  if (process.env.SERVICE_ACCOUNT_KEY) {
+    try {
+      const raw = process.env.SERVICE_ACCOUNT_KEY;
+      if (typeof raw === 'string') return JSON.parse(raw);
+      return raw;
+    } catch (err) {
+      console.error('Failed to parse SERVICE_ACCOUNT_KEY:', err.message || err);
+      throw err;
+    }
+  }
+
+  // 3) Fallback: JSON file path environment variable or default path
+  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+    || process.env.SERVICE_ACCOUNT_PATH
+    || path.resolve(__dirname, '..', 'serviceAccountKey.json');
+
   try {
-    return require(path.resolve(serviceAccountPath));
+    if (!fs.existsSync(serviceAccountPath)) {
+      throw new Error(`Service account file not found at path: ${serviceAccountPath}`);
+    }
+    const loaded = require(serviceAccountPath);
+    return loaded;
   } catch (err) {
-    console.error('Failed to load Firebase service account file at', serviceAccountPath, err);
+    console.error('Failed to load Firebase service account file at', serviceAccountPath, err.message || err);
     throw err;
   }
 }
 
-const serviceAccount = loadServiceAccount();
+let serviceAccount;
+try {
+  serviceAccount = loadServiceAccount();
+} catch (err) {
+  // Re-throw after logging so app will fail fast if misconfigured
+  console.error('Fatal: cannot load Firebase service account. Set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT_PATH correctly.');
+  throw err;
+}
 
-// Make sure project id exists (very important)
-const projectId = serviceAccount.project_id || process.env.FIREBASE_PROJECT_ID;
+// Determine project id: prefer explicit env var, else use service account project_id
+const projectId = process.env.FIREBASE_PROJECT_ID || serviceAccount.project_id;
 if (!projectId) {
-  console.error('Firebase project_id not found in service account JSON and FIREBASE_PROJECT_ID not set.');
-  console.error('Please provide a valid service account that contains "project_id" or set FIREBASE_PROJECT_ID env var.');
-  // Optionally throw here to prevent app from starting in misconfigured state
-  // throw new Error('Missing Firebase project id');
+  const msg = 'Firebase project_id not found in service account JSON and FIREBASE_PROJECT_ID not set.';
+  console.error(msg);
+  throw new Error(msg);
 }
 
 console.log('Initializing Firebase Admin with projectId =', projectId);
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  projectId
-});
+// Initialize only once (protect against double-require)
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    projectId
+  });
+} else {
+  console.log('Firebase Admin already initialized - reusing existing app.');
+}
 
-module.exports = admin;
+// Optional: export a helper to return the messaging instance (makes mocking/testing easier)
+function getMessaging() {
+  return admin.messaging();
+}
+
+module.exports = {
+  admin,
+  getMessaging
+};

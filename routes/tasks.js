@@ -124,7 +124,7 @@ async function sendTaskAssignedNotifications(task, assignedUserIds = []) {
       tokens: uniqueTokens
     };
 
-    const resp = await firebaseAdmin.messaging().sendMulticast(message);
+   const resp = await firebaseAdmin.messaging().sendMulticast(message);
     console.log('FCM sendMulticast results', { success: resp.successCount, failure: resp.failureCount });
 
     if (resp.failureCount > 0) {
