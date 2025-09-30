@@ -99,7 +99,7 @@ async function sendTaskAssignedNotifications(task, assignedUserIds = []) {
       console.log(`Preparing to send notification to user ${uid} (${u.username || u.name || '<no-username>'})`);
       try {
         // sendNotificationToUser (your helper) will fetch tokens from DB and call FCM (it logs too)
-        const results = await notificationService.sendNotificationToUser(uid, `New Task: ${task.title}`, task.description || '');
+        const results = await notificationService.sendNotificationToUserFromDb(uid, `New Task: ${task.title}`, task.description || '');
         console.log(`sendNotificationToUser returned for user ${uid}:`, JSON.stringify(results, null, 2));
 
         // results is an array of per-token send results { token, status, data|error }
